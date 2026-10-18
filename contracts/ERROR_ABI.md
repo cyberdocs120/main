@@ -44,8 +44,9 @@ scope are `malformed`, `oversized`, `expired`, `revoked`, `unsupported`, and
 
 `Retryable` means the *same* call may succeed later with no code or input change,
 once the external condition (unpause, timelock delay, activation ledger, cooldown,
-issuer rotation grace window) has resolved. Every other code requires a different
-input, a different actor, or new evidence before the call can succeed.
+issuer rotation grace window, quota window rollover) has resolved. Every other
+code requires a different input, a different actor, or new evidence before the
+call can succeed.
 
 | Code | Variant | Class | Retryable | Meaning |
 |------|---------|-------|-----------|---------|
@@ -136,6 +137,7 @@ input, a different actor, or new evidence before the call can succeed.
 | 85 | `IssuerRotationNotFound` | state | no | No issuer rotation grace record exists for the requested key. |
 | 86 | `IssuerRotationGraceStillActive` | state | yes | The issuer rotation grace window has not lapsed; retry once it has. |
 | 87 | `CircuitVersionMismatch` | unsupported | no | The scoped envelope commits a circuit version other than the expected one, or is the bare frame that commits none. |
+| 88 | `IssuerQuotaExhausted` | resource | yes | The issuer or source reached its admin-set registration quota for the current window bucket; retry after the bucket rolls over. |
 
 ## Privacy Rules
 
@@ -152,7 +154,7 @@ input, a different actor, or new evidence before the call can succeed.
 
 ## Compatibility And Migration
 
-- **Additive only.** Codes `1..=86` are frozen at this ABI version. A future change
+- **Additive only.** Codes `1..=88` are frozen at this ABI version. A future change
   that needs a new failure appends the next unused discriminant and adds a row here;
   it must not insert, reorder, or reuse a code.
 - **No storage impact.** The ABI describes revert values. It does not add storage

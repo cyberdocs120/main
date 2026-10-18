@@ -581,6 +581,33 @@ pub struct IssuerRotationRecord {
     pub grace_secs: u64,
 }
 
+/// Admin-set registration quota for one key, measured in ledger-time window
+/// buckets (#806). Absence of a record means unlimited, so deployments that
+/// never call `set_issuer_quota` behave exactly as before.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuerQuotaRecord {
+    /// Registrations allowed per key per window bucket. Never zero while the
+    /// record exists; zero clears the quota.
+    pub max_registrations: u32,
+    /// Window-bucket width in seconds. Bucket index is `timestamp /
+    /// window_secs`, so a rollover into the next bucket resets the count.
+    pub window_secs: u64,
+}
+
+/// One small usage record per keyed address: the current ledger-time window
+/// bucket and how many registrations have been charged inside it (#806).
+/// A stored `bucket` behind the current one is treated as empty, so counts
+/// need no explicit reset and the storage stays a single compact record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuerQuotaUsage {
+    /// `ledger timestamp / window_secs` at the time of the last charge.
+    pub bucket: u64,
+    /// Registrations charged inside `bucket`.
+    pub count: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialRootRecordV1 {
@@ -724,6 +751,19 @@ pub struct IssuerRotationGraceExpired {
     pub issuer: Address,
     pub replacement_issuer: Address,
     pub grace_expires_at: u64,
+}
+
+/// Emitted when the admin sets or clears one key's registration quota (#806).
+/// A `max_registrations` (or `window_secs`) of zero publishes the clear, so an
+/// indexer can tell "unlimited" from "no configuration ever" by the event log.
+#[contractevent(topics = ["quota", "set"])]
+pub struct IssuerQuotaSet {
+    #[topic]
+    pub issuer: Address,
+    pub max_registrations: u32,
+    pub window_secs: u64,
+    #[topic]
+    pub set_by: Address,
 }
 
 #[contractevent(topics = ["verif", "set"])]
@@ -1460,6 +1500,10 @@ pub enum DataKey {
     ReporterCooldown(BytesN<32>),
     /// Scoped nullifier separated by verifier address context (#325).
     VerifierNullifier(Address, BytesN<32>),
+    /// Admin-set registration quota for one key (#806). Absent = unlimited.
+    IssuerQuota(Address),
+    /// Current ledger-time window bucket and charge count for a key (#806).
+    IssuerQuotaUsage(Address),
 }
 
 #[contracterror]
@@ -1614,6 +1658,9 @@ pub enum RegistryError {
     /// than [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`], or was the superseded
     /// bare 224-byte frame that commits no circuit version at all (#368).
     CircuitVersionMismatch = 87,
+    /// The key reached its admin-set registration quota for the current
+    /// ledger-time window bucket (#806). Clears on bucket rollover.
+    IssuerQuotaExhausted = 88,
 }
 
 #[contract]
@@ -2867,6 +2914,7 @@ impl HarpocratesRegistry {
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER2_REGISTRATION);
         source.require_auth();
         require_unique(&env, &proof_id, &video_hash);
+        charge_issuer_quota(&env, &source);
 
         let expires_at = compute_expires_at(&env);
         let record = ProofRecord {
@@ -2901,6 +2949,7 @@ impl HarpocratesRegistry {
         if !issuer_record.active {
             panic_with_error!(&env, RegistryError::UnknownIssuer);
         }
+        charge_issuer_quota(&env, &issuer);
 
         let expires_at = compute_expires_at(&env);
         let record = ProofRecord {
@@ -3104,6 +3153,9 @@ impl HarpocratesRegistry {
         let delegation =
             require_delegation(&env, &source, &delegate, DELEGATION_SCOPE_REGISTER_SOURCE);
         require_unique(&env, &proof_id, &video_hash);
+        // The quota is the source's, not the delegate's: delegation is
+        // exercised authority, so the attributed key pays for it (#806).
+        charge_issuer_quota(&env, &source);
 
         let expires_at = bounded_delegated_expiry(&env, delegation.expires_at);
         let record = ProofRecord {
@@ -3153,6 +3205,9 @@ impl HarpocratesRegistry {
         if !issuer_record.active {
             panic_with_error!(&env, RegistryError::UnknownIssuer);
         }
+        // The quota is the issuer's, not the delegate's: a delegate exercises
+        // the issuer's standing, so the issuer pays for it (#806).
+        charge_issuer_quota(&env, &issuer);
 
         let expires_at = bounded_delegated_expiry(&env, delegation.expires_at);
         let record = ProofRecord {
@@ -3176,6 +3231,113 @@ impl HarpocratesRegistry {
         }
         .publish(&env);
         record
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-issuer registration quotas (#806)
+    // -----------------------------------------------------------------------
+    //
+    // A compromised issuer key can otherwise flood the registry with seals
+    // that later need individual revocation. The admin may bound one key's
+    // registrations per ledger-time window bucket; the quota is charged to
+    // the key the registration is *attributed to* — the issuer on Tier 3
+    // seal paths, the source on Tier 2 source paths — so a delegated call
+    // exercises the subject's standing and consumes the subject's quota,
+    // never the delegate's. Anonymous (Tier 1) and batch paths carry no
+    // on-chain identity and are deliberately out of scope.
+    //
+    // Storage is one small record per keyed address: the quota itself
+    // (`DataKey::IssuerQuota`) and a `(bucket, count)` pair
+    // (`DataKey::IssuerQuotaUsage`) whose stale bucket is treated as empty,
+    // so rollover needs no reset transaction. Absence of a quota record
+    // means unlimited, which leaves every existing deployment unaffected.
+
+    /// Set (or clear) `issuer`'s registration quota, admin-only.
+    ///
+    /// `max_registrations` registrations are allowed per key per
+    /// `window_secs`-wide ledger-time bucket (`bucket = timestamp /
+    /// window_secs`). Passing zero for either field clears the quota and
+    /// restores unlimited registrations for that key; the count accrued in
+    /// the previous quota is abandoned with it.
+    ///
+    /// The quota applies to every issuer-attributed registration path —
+    /// `register_seal`, `register_seal_delegated`, `register_source`, and
+    /// `register_source_delegated` — keyed by the attributed subject.
+    ///
+    /// # Reverts
+    ///
+    /// - `NotInitialized` if the registry has no admin
+    /// - `Unauthorized`   if the caller is not the admin
+    pub fn set_issuer_quota(
+        env: Env,
+        admin: Address,
+        issuer: Address,
+        max_registrations: u32,
+        window_secs: u64,
+    ) {
+        require_admin(&env, &admin);
+
+        let quota_key = DataKey::IssuerQuota(issuer.clone());
+        if max_registrations == 0 || window_secs == 0 {
+            env.storage().persistent().remove(&quota_key);
+            // Abandon the stale counter too, so re-arming the quota later
+            // starts from a clean bucket rather than a leftover count.
+            env.storage()
+                .persistent()
+                .remove(&DataKey::IssuerQuotaUsage(issuer.clone()));
+        } else {
+            env.storage().persistent().set(
+                &quota_key,
+                &IssuerQuotaRecord {
+                    max_registrations,
+                    window_secs,
+                },
+            );
+        }
+
+        IssuerQuotaSet {
+            issuer,
+            max_registrations,
+            window_secs,
+            set_by: admin,
+        }
+        .publish(&env);
+    }
+
+    /// Read-only: `issuer`'s configured quota, or `None` when unlimited.
+    pub fn get_issuer_quota(env: Env, issuer: Address) -> Option<IssuerQuotaRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IssuerQuota(issuer))
+    }
+
+    /// Read-only: how many registrations `issuer` has charged inside the
+    /// current window bucket, paired with that bucket's index.
+    ///
+    /// A usage record left behind by an earlier bucket (or an earlier quota
+    /// window) answers `count: 0`, so the pair is always safe to display
+    /// without the caller recomputing rollover. An issuer with no usage
+    /// record, or no quota at all, answers the current bucket with a zero
+    /// count — unset quotas are unlimited, so the count is advisory unless
+    /// a quota is also configured.
+    pub fn get_issuer_quota_usage(env: Env, issuer: Address) -> IssuerQuotaUsage {
+        let quota: Option<IssuerQuotaRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerQuota(issuer.clone()));
+        let bucket = match quota {
+            Some(quota) => issuer_quota_bucket(&env, quota.window_secs),
+            None => env.ledger().timestamp(),
+        };
+        let stored: Option<IssuerQuotaUsage> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerQuotaUsage(issuer));
+        let count = match stored {
+            Some(usage) if usage.bucket == bucket => usage.count,
+            _ => 0,
+        };
+        IssuerQuotaUsage { bucket, count }
     }
 
     pub fn revoke_proof(env: Env, admin: Address, proof_id: BytesN<32>) {
@@ -4753,6 +4915,53 @@ fn delegation_count(env: &Env, grantor: &Address) -> u32 {
         .unwrap_or(0)
 }
 
+/// Ledger-time window-bucket index for a quota of `window_secs` width.
+/// Integer division keeps buckets contiguous from the epoch, so a rollover
+/// is exactly `timestamp / window_secs` advancing by one.
+fn issuer_quota_bucket(env: &Env, window_secs: u64) -> u64 {
+    if window_secs == 0 {
+        return 0;
+    }
+    env.ledger().timestamp() / window_secs
+}
+
+/// Charge one registration against `subject`'s admin-set quota (#806).
+///
+/// No quota record means unlimited and costs one storage probe. Otherwise
+/// the stored `(bucket, count)` pair is rolled forward when the ledger has
+/// entered a new window bucket — the reset needs no admin transaction — and
+/// the count is incremented, or the call reverts with
+/// [`RegistryError::IssuerQuotaExhausted`]. A revert unwinds the increment,
+/// so a rejected registration never consumes quota.
+fn charge_issuer_quota(env: &Env, subject: &Address) {
+    let quota_key = DataKey::IssuerQuota(subject.clone());
+    let quota: Option<IssuerQuotaRecord> = env.storage().persistent().get(&quota_key);
+    let Some(quota) = quota else {
+        return;
+    };
+    // A zeroed record cannot be stored through `set_issuer_quota`, but treat
+    // one defensively as unlimited rather than dividing by zero below.
+    if quota.max_registrations == 0 || quota.window_secs == 0 {
+        return;
+    }
+
+    let bucket = issuer_quota_bucket(env, quota.window_secs);
+    let usage_key = DataKey::IssuerQuotaUsage(subject.clone());
+    let stored: Option<IssuerQuotaUsage> = env.storage().persistent().get(&usage_key);
+    let mut usage = match stored {
+        Some(usage) if usage.bucket == bucket => usage,
+        // A stale bucket (or one from an earlier, wider quota) is empty.
+        _ => IssuerQuotaUsage { bucket, count: 0 },
+    };
+
+    if usage.count >= quota.max_registrations {
+        panic_with_error!(env, RegistryError::IssuerQuotaExhausted);
+    }
+
+    usage.count += 1;
+    env.storage().persistent().set(&usage_key, &usage);
+}
+
 /// Require a live delegation from `grantor` to `delegate` carrying every bit of
 /// `scope`, and authorize the call.
 ///
@@ -6168,6 +6377,8 @@ mod test_fuzz;
 mod test_identity_tier_properties;
 #[cfg(test)]
 mod test_invariants;
+#[cfg(test)]
+mod test_issuer_quota;
 #[cfg(test)]
 mod test_issuer_rotation;
 #[cfg(test)]
