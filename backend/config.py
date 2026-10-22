@@ -77,6 +77,10 @@ class AppConfig:
     external_fetch_max_response_bytes: int
     # Owner-scoped credentials: each key may only register its own sourceAddress.
     register_scoped_keys: tuple[ScopedKey, ...] = ()
+    job_file_ttl_seconds: int = 86_400
+    retention_blob_gc_enabled: bool = False
+    retention_unreferenced_blobs_enabled: bool = False
+
 
 
 def load_config() -> AppConfig:
@@ -149,6 +153,9 @@ def load_config() -> AppConfig:
         external_fetch_read_timeout_seconds=_float_env("EXTERNAL_FETCH_READ_TIMEOUT_SECONDS", 10.0),
         external_fetch_max_response_bytes=_int_env("EXTERNAL_FETCH_MAX_RESPONSE_BYTES", 65_536),
         register_scoped_keys=parse_scoped_keys(_str_env("REGISTER_SCOPED_KEYS")),
+        job_file_ttl_seconds=_job_file_ttl_env(),
+        retention_blob_gc_enabled=_blob_gc_enabled_env(),
+        retention_unreferenced_blobs_enabled=_blob_gc_enabled_env(),
     )
 
 
@@ -270,3 +277,38 @@ def _retention_batch_size_env(name: str = "HARPOCRATES_RETENTION_BATCH_SIZE", de
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer") from exc
     return max(1, min(parsed, RETENTION_BATCH_SIZE_MAX))
+
+
+JOB_FILE_TTL_SECONDS_DEFAULT = 86_400
+
+
+def _job_file_ttl_env(
+    name: str = "HARPOCRATES_JOB_FILE_TTL_SECONDS",
+    default: int = JOB_FILE_TTL_SECONDS_DEFAULT,
+) -> int:
+    """Load HARPOCRATES_JOB_FILE_TTL_SECONDS (default 24h = 86400s)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if parsed < 0:
+        raise RuntimeError(f"{name} must be non-negative")
+    return parsed
+
+
+def _blob_gc_enabled_env() -> bool:
+    """Return whether blob garbage collection is enabled in retention worker."""
+    for var in (
+        "RETENTION_BLOB_GC_ENABLED",
+        "HARPOCRATES_RETENTION_BLOB_GC_ENABLED",
+        "RETENTION_UNREFERENCED_BLOBS_ENABLED",
+        "HARPOCRATES_RETENTION_UNREFERENCED_BLOBS_ENABLED",
+    ):
+        val = os.getenv(var)
+        if val is not None:
+            return val.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
